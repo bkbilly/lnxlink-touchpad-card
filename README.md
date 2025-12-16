@@ -1,6 +1,7 @@
 # LNXlink Touchpad Card
 
 A virtual touchpad card for Home Assistant that allows you to control mouse movements via LnxLink.
+
 <img width="492" height="262" alt="image" src="https://github.com/user-attachments/assets/a2f12dd7-6891-43c1-93d2-d495726a2c20" />
 
 
