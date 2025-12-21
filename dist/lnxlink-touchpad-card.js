@@ -27,7 +27,7 @@ class LnxlinkTouchpad extends HTMLElement {
     this._hasMoved = false;
     this._longPressTimer = null;
     this._isLongPress = false;
-    this._longPressThreshold = config.long_press_threshold || 500;
+    this._longPressThreshold = config.long_press_threshold || 300;
     this._movementThreshold = config.movement_threshold || 5;
     this._isTouchDevice = false;
     this._lastTouchTime = 0;
@@ -42,7 +42,7 @@ class LnxlinkTouchpad extends HTMLElement {
     this.innerHTML = `
       <div id="pad" style="
         width:100%;
-        height:250px;
+        height:100%;
         background:#6d767e;
         border-radius:16px;
         border:1px solid black;
@@ -476,6 +476,18 @@ class LnxlinkTouchpad extends HTMLElement {
 
   getCardSize() {
     return 3;
+  }
+
+  // Sections view sizing support
+  getLayoutOptions() {
+    return {
+      grid_columns: 4,
+      grid_min_columns: 2,
+      grid_max_columns: 12,
+      grid_rows: 5,
+      grid_min_rows: 2,
+      grid_max_rows: 8
+    };
   }
 
   static getConfigElement() {
