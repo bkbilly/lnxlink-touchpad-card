@@ -39,6 +39,13 @@ class LnxlinkTouchpad extends HTMLElement {
     this._dragInactivityTimer = null;
     this._dragInactivityTimeout = config.drag_inactivity_timeout || 600;
 
+    // --- New Scroll Variables ---
+    this._isTwoFingerDrag = false;
+    this._twoFingerLastY = 0;
+    this._scrollAccumulator = 0;
+    this._scrollSensitivity = config.scroll_sensitivity || 20; // Pixels needed to trigger one scroll
+    // ---------------------------
+
     this.innerHTML = `
       <div id="pad" style="
         width:100%;
@@ -92,7 +99,8 @@ class LnxlinkTouchpad extends HTMLElement {
     });
 
     pad.addEventListener("mousemove", e => {
-      if (this._isDragging) {
+      // Allow moving if dragging OR if doing a two-finger drag
+      if (this._isDragging || this._isTwoFingerDrag) {
         e.preventDefault();
         this._move(e);
       }
@@ -129,13 +137,19 @@ class LnxlinkTouchpad extends HTMLElement {
   _start(e) {
     const p = e.touches ? e.touches[0] : e;
     
+    // Check for Two Finger Start
     if (e.touches && e.touches.length === 2) {
       this._isTwoFingerTap = true;
-      console.log("Two-finger touch detected");
+      this._isTwoFingerDrag = true;
+      // Calculate average Y of both fingers
+      this._twoFingerLastY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      this._scrollAccumulator = 0;
+      console.log("Two-finger touch detected (Potential Scroll)");
       return;
     }
     
     this._isTwoFingerTap = false;
+    this._isTwoFingerDrag = false;
     this._lastX = p.clientX;
     this._lastY = p.clientY;
     this._startX = p.clientX;
@@ -160,6 +174,40 @@ class LnxlinkTouchpad extends HTMLElement {
   }
 
   _move(e) {
+    // --- Scroll Logic (Two Fingers) ---
+    if (this._isTwoFingerDrag && e.touches && e.touches.length === 2) {
+      const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      const dy = currentY - this._twoFingerLastY;
+      
+      // If moved significantly, it is definitely a scroll, not a tap
+      if (Math.abs(dy) > 2) {
+        this._hasMoved = true; // Prevents "Right Click" on release
+      }
+
+      this._scrollAccumulator += dy;
+      this._twoFingerLastY = currentY;
+
+      // Threshold check for Scroll Down (fingers move UP on screen visually, but physical move is down?)
+      // Standard Touchpad: Fingers move UP = Scroll DOWN content. 
+      // Let's stick to direct mapping: 
+      // Fingers UP (negative dy) -> Scroll Up Action
+      // Fingers DOWN (positive dy) -> Scroll Down Action
+      
+      while (this._scrollAccumulator < -this._scrollSensitivity) {
+        console.log("Scrolling UP");
+        this._handleScrollUp();
+        this._scrollAccumulator += this._scrollSensitivity;
+      }
+      
+      while (this._scrollAccumulator > this._scrollSensitivity) {
+        console.log("Scrolling DOWN");
+        this._handleScrollDown();
+        this._scrollAccumulator -= this._scrollSensitivity;
+      }
+      return;
+    }
+    // ----------------------------------
+
     if (!this._isDragging || this._lastX === null || !this._hass) return;
 
     const p = e.touches ? e.touches[0] : e;
@@ -199,30 +247,16 @@ class LnxlinkTouchpad extends HTMLElement {
       const x = dx >= 0 ? `+${dx}` : `${dx}`;
       const y = dy >= 0 ? `+${dy}` : `${dy}`;
 
-      console.log(`Sending coords: ${x},${y} (velocity: ${velocity.toFixed(2)}, multiplier: ${accelerationMultiplier.toFixed(2)})`);
+      // console.log(`Sending coords: ${x},${y}`);
 
       const [domain] = this.config.coord_entity.split(".");
       let service, serviceData;
       
-      if (domain === "input_text") {
-        service = "set_value";
-        serviceData = {
-          entity_id: this.config.coord_entity,
-          value: `${x},${y}`
-        };
-      } else if (domain === "text") {
-        service = "set_value";
-        serviceData = {
-          entity_id: this.config.coord_entity,
-          value: `${x},${y}`
-        };
-      } else {
-        service = "set_value";
-        serviceData = {
-          entity_id: this.config.coord_entity,
-          value: `${x},${y}`
-        };
-      }
+      service = "set_value";
+      serviceData = {
+        entity_id: this.config.coord_entity,
+        value: `${x},${y}`
+      };
       
       this._hass.callService(domain, service, serviceData);
       
@@ -238,10 +272,16 @@ class LnxlinkTouchpad extends HTMLElement {
       this._longPressTimer = null;
     }
     
-    if (this._isTwoFingerTap && !this._hasMoved) {
-      console.log("Two-finger tap detected - right click");
-      this._handleRightClick();
+    // Two Finger End Logic
+    if (this._isTwoFingerTap) {
+      // If we haven't moved significantly, it's a right click
+      if (!this._hasMoved) {
+        console.log("Two-finger tap detected - right click");
+        this._handleRightClick();
+      }
+      // Reset scroll/two-finger state
       this._isTwoFingerTap = false;
+      this._isTwoFingerDrag = false;
       this._cancel();
       return;
     }
@@ -292,6 +332,7 @@ class LnxlinkTouchpad extends HTMLElement {
     }
     
     this._isDragging = false;
+    this._isTwoFingerDrag = false; // Ensure this is reset
     this._lastX = null;
     this._lastY = null;
     this._startX = null;
@@ -305,52 +346,36 @@ class LnxlinkTouchpad extends HTMLElement {
     }
   }
 
+  _handleScrollUp() {
+    if (!this.config.scroll_up_action || !this._hass) return;
+    this._executeAction(this.config.scroll_up_action);
+  }
+
+  _handleScrollDown() {
+    if (!this.config.scroll_down_action || !this._hass) return;
+    this._executeAction(this.config.scroll_down_action);
+  }
+
   _handleTap(e) {
     console.log("Tap detected - left click");
-    
-    if (navigator.vibrate) {
-      navigator.vibrate(10);
-    }
-    
-    if (!this.config.tap_action || !this._hass) {
-      console.log("No tap_action configured or hass not available");
-      return;
-    }
-
-    const action = this.config.tap_action;
-    console.log("Tap action:", action);
-
-    this._executeAction(action);
-    
-    const indicator = this.querySelector("#indicator");
-    if (indicator) {
-      indicator.style.background = "rgba(0,150,255,0.8)";
-      setTimeout(() => {
-        indicator.style.background = "rgba(255,255,255,0.3)";
-      }, 200);
-    }
+    if (navigator.vibrate) navigator.vibrate(10);
+    if (!this.config.tap_action || !this._hass) return;
+    this._executeAction(this.config.tap_action);
+    this._flashIndicator("rgba(0,150,255,0.8)");
   }
 
   _handleRightClick() {
     console.log("Right click action");
-    
-    if (navigator.vibrate) {
-      navigator.vibrate(15);
-    }
-    
-    if (!this.config.right_click_action || !this._hass) {
-      console.log("No right_click_action configured or hass not available");
-      return;
-    }
-
-    const action = this.config.right_click_action;
-    console.log("Right click action:", action);
-
-    this._executeAction(action);
-    
+    if (navigator.vibrate) navigator.vibrate(15);
+    if (!this.config.right_click_action || !this._hass) return;
+    this._executeAction(this.config.right_click_action);
+    this._flashIndicator("rgba(255,100,0,0.8)");
+  }
+  
+  _flashIndicator(color) {
     const indicator = this.querySelector("#indicator");
     if (indicator) {
-      indicator.style.background = "rgba(255,100,0,0.8)";
+      indicator.style.background = color;
       setTimeout(() => {
         indicator.style.background = "rgba(255,255,255,0.3)";
       }, 200);
@@ -358,41 +383,24 @@ class LnxlinkTouchpad extends HTMLElement {
   }
 
   _startDrag() {
-    if (!this.config.drag_start_action || !this._hass) {
-      console.log("No drag_start_action configured");
-      return;
-    }
-    
+    if (!this.config.drag_start_action || !this._hass) return;
     this._isMouseDown = true;
-    console.log("Starting drag mode");
-    
-    if (navigator.vibrate) {
-      navigator.vibrate([50, 30, 50]);
-    }
+    if (navigator.vibrate) navigator.vibrate([50, 30, 50]);
     
     const dragIndicator = this.querySelector("#drag-indicator");
-    if (dragIndicator) {
-      dragIndicator.style.display = "block";
-    }
+    if (dragIndicator) dragIndicator.style.display = "block";
     
     const pad = this.querySelector("#pad");
-    if (pad) {
-      pad.style.background = "#8b5a3c";
-    }
+    if (pad) pad.style.background = "#8b5a3c";
     
     this._executeAction(this.config.drag_start_action);
-    
     this._resetDragInactivityTimer();
   }
 
   _resetDragInactivityTimer() {
-    if (this._dragInactivityTimer) {
-      clearTimeout(this._dragInactivityTimer);
-    }
-    
+    if (this._dragInactivityTimer) clearTimeout(this._dragInactivityTimer);
     this._dragInactivityTimer = setTimeout(() => {
       if (this._isMouseDown) {
-        console.log("Drag inactivity timeout - auto-releasing");
         this._releaseDrag();
         this._cancel();
       }
@@ -400,32 +408,19 @@ class LnxlinkTouchpad extends HTMLElement {
   }
 
   _releaseDrag() {
-    if (!this.config.drag_end_action || !this._hass) {
-      console.log("No drag_end_action configured");
-      return;
-    }
-    
+    if (!this.config.drag_end_action || !this._hass) return;
     this._isMouseDown = false;
-    console.log("Ending drag mode");
-    
-    if (navigator.vibrate) {
-      navigator.vibrate(20);
-    }
-    
+    if (navigator.vibrate) navigator.vibrate(20);
     if (this._dragInactivityTimer) {
       clearTimeout(this._dragInactivityTimer);
       this._dragInactivityTimer = null;
     }
     
     const dragIndicator = this.querySelector("#drag-indicator");
-    if (dragIndicator) {
-      dragIndicator.style.display = "none";
-    }
+    if (dragIndicator) dragIndicator.style.display = "none";
     
     const pad = this.querySelector("#pad");
-    if (pad) {
-      pad.style.background = "#6d767e";
-    }
+    if (pad) pad.style.background = "#6d767e";
     
     this._executeAction(this.config.drag_end_action);
   }
@@ -434,59 +429,36 @@ class LnxlinkTouchpad extends HTMLElement {
     if (action.action === "call-service" && action.service) {
       const [domain, service] = action.service.split(".");
       const serviceData = action.service_data || action.data || {};
-      console.log(`Calling service: ${domain}.${service}`, serviceData);
       this._hass.callService(domain, service, serviceData);
     } else if (action.action && action.action.includes(".")) {
       const [domain, service] = action.action.split(".");
       const target = action.target || {};
       const serviceData = { ...target, ...(action.data || {}) };
-      console.log(`Calling service: ${domain}.${service}`, serviceData);
       this._hass.callService(domain, service, serviceData);
     } else if (action.action === "navigate" && action.navigation_path) {
-      console.log(`Navigating to: ${action.navigation_path}`);
       window.history.pushState(null, "", action.navigation_path);
       window.dispatchEvent(new Event("location-changed"));
     } else if (action.action === "url" && action.url_path) {
-      console.log(`Opening URL: ${action.url_path}`);
       window.open(action.url_path, "_blank");
     } else if (action.action === "toggle") {
       const entityId = action.entity || action.entity_id;
       if (entityId) {
         const [domain] = entityId.split(".");
-        console.log(`Toggling: ${entityId}`);
         this._hass.callService(domain, "toggle", { entity_id: entityId });
       }
     } else {
-      console.log("Dispatching hass-action event");
-      const event = new Event("hass-action", {
-        bubbles: true,
-        composed: true
-      });
-
-      event.detail = {
-        config: {
-          tap_action: action
-        },
-        action: "tap"
-      };
-
+      const event = new Event("hass-action", { bubbles: true, composed: true });
+      event.detail = { config: { tap_action: action }, action: "tap" };
       this.dispatchEvent(event);
     }
   }
 
-  getCardSize() {
-    return 3;
-  }
+  getCardSize() { return 3; }
 
-  // Sections view sizing support
   getLayoutOptions() {
     return {
-      grid_columns: 4,
-      grid_min_columns: 2,
-      grid_max_columns: 12,
-      grid_rows: 5,
-      grid_min_rows: 2,
-      grid_max_rows: 8
+      grid_columns: 4, grid_min_columns: 2, grid_max_columns: 12,
+      grid_rows: 5, grid_min_rows: 2, grid_max_rows: 8
     };
   }
 
@@ -499,11 +471,14 @@ class LnxlinkTouchpad extends HTMLElement {
       coord_entity: "",
       sensitivity: 1.0,
       acceleration: 1.5,
+      scroll_sensitivity: 20,
       long_press_threshold: 500,
       movement_threshold: 5,
       drag_inactivity_timeout: 600,
       tap_action: { action: "none" },
       right_click_action: { action: "none" },
+      scroll_up_action: { action: "none" },
+      scroll_down_action: { action: "none" },
       drag_start_action: { action: "none" },
       drag_end_action: { action: "none" }
     };
@@ -516,11 +491,14 @@ class LnxlinkTouchpadEditor extends HTMLElement {
       coord_entity: "",
       sensitivity: 1.0,
       acceleration: 1.5,
+      scroll_sensitivity: 20,
       long_press_threshold: 500,
       movement_threshold: 5,
       drag_inactivity_timeout: 600,
       tap_action: { action: "none" },
       right_click_action: { action: "none" },
+      scroll_up_action: { action: "none" },
+      scroll_down_action: { action: "none" },
       drag_start_action: { action: "none" },
       drag_end_action: { action: "none" },
       ...config
@@ -539,7 +517,6 @@ class LnxlinkTouchpadEditor extends HTMLElement {
     if (!this._hass || !this._config) return;
     this._rendered = true;
 
-    // Create container if it doesn't exist
     if (!this.shadowRoot && !this._container) {
       this._container = document.createElement('div');
       this.appendChild(this._container);
@@ -549,232 +526,106 @@ class LnxlinkTouchpadEditor extends HTMLElement {
     
     container.innerHTML = `
       <style>
-        .config-row {
-          display: flex;
-          align-items: center;
-          margin-bottom: 12px;
-        }
-        .config-row > * {
-          flex: 1;
-          margin-left: 8px;
-        }
-        .config-row > *:first-child {
-          margin-left: 0;
-          flex: 0 0 40%;
-        }
-        ha-selector {
-          width: 100%;
-        }
-        .header {
-          font-weight: 500;
-          margin-top: 16px;
-          margin-bottom: 8px;
-          padding-top: 16px;
-          border-top: 1px solid var(--divider-color);
-        }
-        .header:first-child {
-          margin-top: 0;
-          padding-top: 0;
-          border-top: none;
-        }
+        .config-row { display: flex; align-items: center; margin-bottom: 12px; }
+        .config-row > * { flex: 1; margin-left: 8px; }
+        .config-row > *:first-child { margin-left: 0; flex: 0 0 40%; }
+        ha-selector { width: 100%; }
+        .header { font-weight: 500; margin-top: 16px; margin-bottom: 8px; padding-top: 16px; border-top: 1px solid var(--divider-color); }
+        .header:first-child { margin-top: 0; padding-top: 0; border-top: none; }
       </style>
       
       <div class="header">Required Settings</div>
-      
       <div class="config-row">
         <label>Coordinate Entity</label>
         <div class="selector-container" data-selector="coord_entity"></div>
       </div>
 
-      <div class="header">Movement Settings</div>
-      
+      <div class="header">Movement & Scroll Settings</div>
       <div class="config-row">
         <label>Sensitivity</label>
         <div class="selector-container" data-selector="sensitivity"></div>
       </div>
-
       <div class="config-row">
         <label>Acceleration</label>
         <div class="selector-container" data-selector="acceleration"></div>
       </div>
-
+      <div class="config-row">
+        <label>Scroll Sensitivity (px)</label>
+        <div class="selector-container" data-selector="scroll_sensitivity"></div>
+      </div>
       <div class="config-row">
         <label>Movement Threshold (px)</label>
         <div class="selector-container" data-selector="movement_threshold"></div>
       </div>
 
       <div class="header">Timing Settings</div>
-      
       <div class="config-row">
         <label>Long Press Threshold (ms)</label>
         <div class="selector-container" data-selector="long_press_threshold"></div>
       </div>
-
       <div class="config-row">
         <label>Drag Inactivity Timeout (ms)</label>
         <div class="selector-container" data-selector="drag_inactivity_timeout"></div>
       </div>
 
       <div class="header">Actions</div>
-      
       <div class="config-row">
         <label>Tap Action (Left Click)</label>
         <div class="selector-container" data-selector="tap_action"></div>
       </div>
-
       <div class="config-row">
-        <label>Right Click Action</label>
+        <label>Right Click Action (2 Fingers Tap)</label>
         <div class="selector-container" data-selector="right_click_action"></div>
       </div>
-
+      <div class="config-row">
+        <label>Scroll Up Action (2 Fingers Up)</label>
+        <div class="selector-container" data-selector="scroll_up_action"></div>
+      </div>
+      <div class="config-row">
+        <label>Scroll Down Action (2 Fingers Down)</label>
+        <div class="selector-container" data-selector="scroll_down_action"></div>
+      </div>
       <div class="config-row">
         <label>Drag Start Action</label>
         <div class="selector-container" data-selector="drag_start_action"></div>
       </div>
-
       <div class="config-row">
         <label>Drag End Action</label>
         <div class="selector-container" data-selector="drag_end_action"></div>
       </div>
     `;
 
-    // Now create and attach the selectors properly
-    this._createSelector('coord_entity', 
-      { entity: { domain: ["input_text", "text"] } }, 
-      this._config.coord_entity,
-      this._coordEntityChanged.bind(this)
-    );
+    this._createSelector('coord_entity', { entity: { domain: ["input_text", "text"] } }, this._config.coord_entity, this._handleChange.bind(this, 'coord_entity'));
+    this._createSelector('sensitivity', { number: { min: 0.1, max: 5.0, step: 0.1, mode: "box" } }, this._config.sensitivity, this._handleChange.bind(this, 'sensitivity'));
+    this._createSelector('acceleration', { number: { min: 1.0, max: 5.0, step: 0.1, mode: "box" } }, this._config.acceleration, this._handleChange.bind(this, 'acceleration'));
+    this._createSelector('scroll_sensitivity', { number: { min: 5, max: 100, step: 5, mode: "box" } }, this._config.scroll_sensitivity, this._handleChange.bind(this, 'scroll_sensitivity'));
+    this._createSelector('movement_threshold', { number: { min: 1, max: 50, step: 1, mode: "box" } }, this._config.movement_threshold, this._handleChange.bind(this, 'movement_threshold'));
+    this._createSelector('long_press_threshold', { number: { min: 100, max: 2000, step: 50, mode: "box" } }, this._config.long_press_threshold, this._handleChange.bind(this, 'long_press_threshold'));
+    this._createSelector('drag_inactivity_timeout', { number: { min: 100, max: 5000, step: 100, mode: "box" } }, this._config.drag_inactivity_timeout, this._handleChange.bind(this, 'drag_inactivity_timeout'));
     
-    this._createSelector('sensitivity',
-      { number: { min: 0.1, max: 5.0, step: 0.1, mode: "box" } },
-      this._config.sensitivity,
-      this._sensitivityChanged.bind(this)
-    );
-    
-    this._createSelector('acceleration',
-      { number: { min: 1.0, max: 5.0, step: 0.1, mode: "box" } },
-      this._config.acceleration,
-      this._accelerationChanged.bind(this)
-    );
-    
-    this._createSelector('movement_threshold',
-      { number: { min: 1, max: 50, step: 1, mode: "box" } },
-      this._config.movement_threshold,
-      this._movementThresholdChanged.bind(this)
-    );
-    
-    this._createSelector('long_press_threshold',
-      { number: { min: 100, max: 2000, step: 50, mode: "box" } },
-      this._config.long_press_threshold,
-      this._longPressChanged.bind(this)
-    );
-    
-    this._createSelector('drag_inactivity_timeout',
-      { number: { min: 100, max: 5000, step: 100, mode: "box" } },
-      this._config.drag_inactivity_timeout,
-      this._dragTimeoutChanged.bind(this)
-    );
-    
-    this._createSelector('tap_action',
-      { "ui-action": {} },
-      this._config.tap_action,
-      this._tapActionChanged.bind(this)
-    );
-    
-    this._createSelector('right_click_action',
-      { "ui-action": {} },
-      this._config.right_click_action,
-      this._rightClickActionChanged.bind(this)
-    );
-    
-    this._createSelector('drag_start_action',
-      { "ui-action": {} },
-      this._config.drag_start_action,
-      this._dragStartActionChanged.bind(this)
-    );
-    
-    this._createSelector('drag_end_action',
-      { "ui-action": {} },
-      this._config.drag_end_action,
-      this._dragEndActionChanged.bind(this)
-    );
+    this._createSelector('tap_action', { "ui-action": {} }, this._config.tap_action, this._handleChange.bind(this, 'tap_action'));
+    this._createSelector('right_click_action', { "ui-action": {} }, this._config.right_click_action, this._handleChange.bind(this, 'right_click_action'));
+    this._createSelector('scroll_up_action', { "ui-action": {} }, this._config.scroll_up_action, this._handleChange.bind(this, 'scroll_up_action'));
+    this._createSelector('scroll_down_action', { "ui-action": {} }, this._config.scroll_down_action, this._handleChange.bind(this, 'scroll_down_action'));
+    this._createSelector('drag_start_action', { "ui-action": {} }, this._config.drag_start_action, this._handleChange.bind(this, 'drag_start_action'));
+    this._createSelector('drag_end_action', { "ui-action": {} }, this._config.drag_end_action, this._handleChange.bind(this, 'drag_end_action'));
   }
 
   _createSelector(name, selector, value, changeHandler) {
     const containerEl = this.querySelector(`[data-selector="${name}"]`);
     if (!containerEl) return;
-
     const selectorEl = document.createElement('ha-selector');
     selectorEl.hass = this._hass;
     selectorEl.selector = selector;
     selectorEl.value = value;
     selectorEl.addEventListener('value-changed', changeHandler);
-    
     containerEl.innerHTML = '';
     containerEl.appendChild(selectorEl);
   }
 
-  _coordEntityChanged(ev) {
+  _handleChange(key, ev) {
     if (!this._config) return;
-    this._config.coord_entity = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _sensitivityChanged(ev) {
-    if (!this._config) return;
-    this._config.sensitivity = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _accelerationChanged(ev) {
-    if (!this._config) return;
-    this._config.acceleration = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _movementThresholdChanged(ev) {
-    if (!this._config) return;
-    this._config.movement_threshold = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _longPressChanged(ev) {
-    if (!this._config) return;
-    this._config.long_press_threshold = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _dragTimeoutChanged(ev) {
-    if (!this._config) return;
-    this._config.drag_inactivity_timeout = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _tapActionChanged(ev) {
-    if (!this._config) return;
-    this._config.tap_action = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _rightClickActionChanged(ev) {
-    if (!this._config) return;
-    this._config.right_click_action = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _dragStartActionChanged(ev) {
-    if (!this._config) return;
-    this._config.drag_start_action = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _dragEndActionChanged(ev) {
-    if (!this._config) return;
-    this._config.drag_end_action = ev.detail.value;
-    this._fireConfigChanged();
-  }
-
-  _fireConfigChanged() {
+    this._config[key] = ev.detail.value;
     const event = new CustomEvent("config-changed", {
       detail: { config: this._config },
       bubbles: true,
@@ -787,7 +638,6 @@ class LnxlinkTouchpadEditor extends HTMLElement {
 customElements.define("lnxlink-touchpad", LnxlinkTouchpad);
 customElements.define("lnxlink-touchpad-editor", LnxlinkTouchpadEditor);
 
-// Register the card in Home Assistant's card picker
 window.customCards = window.customCards || [];
 window.customCards.push({
   type: "lnxlink-touchpad",
