@@ -38,12 +38,17 @@ class LnxlinkTouchpad extends HTMLElement {
     this._isTwoFingerTap = false;
     this._dragInactivityTimer = null;
     this._dragInactivityTimeout = config.drag_inactivity_timeout || 600;
+    this._pointerDown = false;
 
     // --- New Scroll Variables ---
     this._isTwoFingerDrag = false;
     this._twoFingerLastY = 0;
     this._scrollAccumulator = 0;
-    this._scrollSensitivity = config.scroll_sensitivity || 20; // Pixels needed to trigger one scroll
+    this._scrollSensitivity = config.scroll_sensitivity || 40; // Pixels needed to trigger one scroll
+    this._scrollMinInterval = config.scroll_min_interval || 120; // Min ms between scroll actions
+    this._lastScrollActionTime = 0;
+    this._scrollAcceleration = config.scroll_acceleration || 15; // Same idea as cursor acceleration: fast swipes count for more
+    this._lastScrollMoveTime = 0;
     // ---------------------------
 
     this.innerHTML = `
@@ -74,6 +79,17 @@ class LnxlinkTouchpad extends HTMLElement {
           font-weight:bold;
           display:none;
         ">DRAG MODE</div>
+        <div id="scroll-indicator" style="
+          position:absolute;
+          bottom:10px;
+          left:10px;
+          padding:4px 8px;
+          background:rgba(0,140,255,0.9);
+          border-radius:4px;
+          font-size:12px;
+          font-weight:bold;
+          display:none;
+        ">SCROLL MODE</div>
         <div id="indicator" style="
           position:absolute;
           top:10px;
@@ -90,7 +106,12 @@ class LnxlinkTouchpad extends HTMLElement {
     const pad = this.querySelector("#pad");
 
     pad.addEventListener("mousedown", e => {
-      if (Date.now() - this._lastTouchTime < 500) {
+      // Once this device has shown itself to be touch-capable, permanently
+      // ignore mouse events on this pad. Some WebViews/browsers still fire
+      // a synthetic "mousedown" for a real touch even when preventDefault()
+      // is called on touchstart, so a short time window isn't reliable -
+      // this closes that off for good rather than just for 500ms.
+      if (this._isTouchDevice) {
         e.preventDefault();
         return;
       }
@@ -99,6 +120,7 @@ class LnxlinkTouchpad extends HTMLElement {
     });
 
     pad.addEventListener("mousemove", e => {
+      if (this._isTouchDevice) return;
       // Allow moving if dragging OR if doing a two-finger drag
       if (this._isDragging || this._isTwoFingerDrag) {
         e.preventDefault();
@@ -107,7 +129,7 @@ class LnxlinkTouchpad extends HTMLElement {
     });
 
     pad.addEventListener("mouseup", e => {
-      if (Date.now() - this._lastTouchTime < 500) {
+      if (this._isTouchDevice) {
         e.preventDefault();
         return;
       }
@@ -115,13 +137,20 @@ class LnxlinkTouchpad extends HTMLElement {
       this._end(e);
     });
 
-    pad.addEventListener("mouseleave", () => this._cancel());
+    pad.addEventListener("mouseleave", () => {
+      if (this._isTouchDevice) return;
+      this._cancel();
+    });
 
     pad.addEventListener("touchstart", e => {
       this._lastTouchTime = Date.now();
       this._isTouchDevice = true;
+      // Non-passive so this actually suppresses the browser's follow-up
+      // synthetic mouse events for this touch (a passive listener can call
+      // preventDefault(), but it's silently ignored).
+      if (e.cancelable) e.preventDefault();
       this._start(e);
-    }, { passive: true });
+    }, { passive: false });
 
     pad.addEventListener("touchmove", e => {
       this._move(e);
@@ -141,15 +170,70 @@ class LnxlinkTouchpad extends HTMLElement {
     if (e.touches && e.touches.length === 2) {
       this._isTwoFingerTap = true;
       this._isTwoFingerDrag = true;
+      this._pointerDown = true;
+
+      // The first finger's touchstart already ran the single-finger _start
+      // path below (arming the long-press timer and setting _isDragging/
+      // _lastX/_lastY) before this second finger landed. If we don't clear
+      // that here, it lingers: once this gesture drops back down to one
+      // finger, _move()'s two-finger check (length === 2) fails and falls
+      // through to the single-finger cursor-move code, which then finds
+      // _isDragging still true and moves the mouse instead of continuing
+      // to scroll.
+      if (this._longPressTimer) {
+        clearTimeout(this._longPressTimer);
+        this._longPressTimer = null;
+      }
+      this._isDragging = false;
+      this._lastX = null;
+      this._lastY = null;
+      this._startX = null;
+      this._startY = null;
+      this._hasMoved = false;
+      this._isLongPress = false;
+
       // Calculate average Y of both fingers
       this._twoFingerLastY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
       this._scrollAccumulator = 0;
+      this._lastScrollMoveTime = Date.now();
       console.log("Two-finger touch detected (Potential Scroll)");
+
+      // Don't show the SCROLL MODE badge yet - two fingers landing could
+      // still turn out to be a stationary two-finger tap (right click).
+      // It's only revealed in _move() once real vertical movement proves
+      // this is actually a scroll.
+
+      // Fingers are down again - if a drag inactivity countdown was
+      // already running (e.g. we were mid-sticky-wait from a previous
+      // single-finger drag), pause it while these fingers are touching.
+      if (this._dragInactivityTimer) {
+        clearTimeout(this._dragInactivityTimer);
+        this._dragInactivityTimer = null;
+      }
+
       return;
     }
     
+    // Guard against duplicate "start" events for the same physical touch.
+    // Some browsers/WebViews fire a synthetic "mousedown" very close to
+    // (or not reliably after) the real "touchstart" for a single press.
+    // Without this, both events independently arm their own long-press
+    // timer, so drag mode - and its vibration - fires twice for one press.
+    if (this._pointerDown) {
+      return;
+    }
+
     this._isTwoFingerTap = false;
     this._isTwoFingerDrag = false;
+    this._pointerDown = true;
+
+    // Finger/mouse is down again - the inactivity countdown (which only
+    // applies while the pointer is lifted mid-drag) must not keep running.
+    if (this._dragInactivityTimer) {
+      clearTimeout(this._dragInactivityTimer);
+      this._dragInactivityTimer = null;
+    }
+
     this._lastX = p.clientX;
     this._lastY = p.clientY;
     this._startX = p.clientX;
@@ -175,35 +259,85 @@ class LnxlinkTouchpad extends HTMLElement {
 
   _move(e) {
     // --- Scroll Logic (Two Fingers) ---
-    if (this._isTwoFingerDrag && e.touches && e.touches.length === 2) {
-      const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-      const dy = currentY - this._twoFingerLastY;
+    // Once a two-finger scroll gesture is active, keep tracking it even if
+    // one finger lifts before the other (touches.length drops to 1). Real
+    // two-finger lifts rarely happen in the exact same instant, and if we
+    // required length === 2 here, that brief single-finger tail would fall
+    // through to the single-finger cursor-move code below and jerk the
+    // mouse. The gesture only truly ends when the last finger lifts
+    // (handled by touchend/_end, not here).
+    if (this._isTwoFingerDrag && e.touches && e.touches.length >= 1) {
+      const currentY = e.touches.length >= 2
+        ? (e.touches[0].clientY + e.touches[1].clientY) / 2
+        : e.touches[0].clientY;
+      const rawDy = currentY - this._twoFingerLastY;
       
       // If moved significantly, it is definitely a scroll, not a tap
-      if (Math.abs(dy) > 2) {
+      if (Math.abs(rawDy) > 2) {
         this._hasMoved = true; // Prevents "Right Click" on release
+
+        // Only reveal SCROLL MODE now that movement has actually confirmed
+        // it - showing it right at two-finger touchdown made it appear on
+        // ordinary two-finger taps (right click) too.
+        const scrollIndicator = this.querySelector("#scroll-indicator");
+        if (scrollIndicator) scrollIndicator.style.display = "block";
       }
 
-      this._scrollAccumulator += dy;
+      // Acceleration for scroll works the same way cursor acceleration
+      // changes cursor speed, but applied to firing rate instead of
+      // distance: a fast swipe shortens both the minimum time gap AND the
+      // distance needed between scroll ticks, so ticks fire more often.
+      //
+      // Both need to shrink together. At ordinary swipe speeds, the
+      // distance gate (scroll_sensitivity, e.g. 40px) is what's actually
+      // limiting tick rate, not the time gate - 40px worth of movement
+      // usually takes longer to accumulate than scroll_min_interval takes
+      // to elapse, so shrinking only the interval had no effect except on
+      // very fast flicks. Scaling the distance threshold down too makes
+      // acceleration noticeable across the whole speed range.
+      const now = Date.now();
+      const scrollTimeDelta = Math.max(now - this._lastScrollMoveTime, 1);
+      const scrollVelocity = Math.abs(rawDy) / scrollTimeDelta;
+      const scrollAccelFactor = 1 + (scrollVelocity * this._scrollAcceleration);
+
+      const effectiveScrollMinInterval = Math.max(this._scrollMinInterval / scrollAccelFactor, 15);
+      const effectiveScrollSensitivity = Math.max(this._scrollSensitivity / scrollAccelFactor, 8);
+
+      this._scrollAccumulator += rawDy;
       this._twoFingerLastY = currentY;
+      this._lastScrollMoveTime = now;
 
       // Threshold check for Scroll Down (fingers move UP on screen visually, but physical move is down?)
       // Standard Touchpad: Fingers move UP = Scroll DOWN content. 
       // Let's stick to direct mapping: 
       // Fingers UP (negative dy) -> Scroll Up Action
       // Fingers DOWN (positive dy) -> Scroll Down Action
-      
-      while (this._scrollAccumulator < -this._scrollSensitivity) {
+
+      // Fire at most ONE scroll tick per touch event (a fast swipe can
+      // otherwise dump many ticks' worth of dy in a single event, which
+      // is what makes scrolling feel like it's "running away"). Any
+      // leftover distance just carries over in the accumulator to the
+      // next event instead of being drained all at once.
+      const canFireScroll = (now - this._lastScrollActionTime) >= effectiveScrollMinInterval;
+
+      if (canFireScroll && this._scrollAccumulator < -effectiveScrollSensitivity) {
         console.log("Scrolling UP");
         this._handleScrollUp();
-        this._scrollAccumulator += this._scrollSensitivity;
-      }
-      
-      while (this._scrollAccumulator > this._scrollSensitivity) {
+        this._scrollAccumulator += effectiveScrollSensitivity;
+        this._lastScrollActionTime = now;
+      } else if (canFireScroll && this._scrollAccumulator > effectiveScrollSensitivity) {
         console.log("Scrolling DOWN");
         this._handleScrollDown();
-        this._scrollAccumulator -= this._scrollSensitivity;
+        this._scrollAccumulator -= effectiveScrollSensitivity;
+        this._lastScrollActionTime = now;
       }
+
+      // Don't let the accumulator build up unbounded while we're waiting
+      // out the rate limit - clamp it so a paused/blocked burst can't
+      // unload as one huge jump once canFireScroll becomes true again.
+      const maxAccum = this._scrollSensitivity * 2;
+      if (this._scrollAccumulator > maxAccum) this._scrollAccumulator = maxAccum;
+      if (this._scrollAccumulator < -maxAccum) this._scrollAccumulator = -maxAccum;
       return;
     }
     // ----------------------------------
@@ -259,10 +393,6 @@ class LnxlinkTouchpad extends HTMLElement {
       };
       
       this._hass.callService(domain, service, serviceData);
-      
-      if (this._isMouseDown) {
-        this._resetDragInactivityTimer();
-      }
     }
   }
 
@@ -270,6 +400,17 @@ class LnxlinkTouchpad extends HTMLElement {
     if (this._longPressTimer) {
       clearTimeout(this._longPressTimer);
       this._longPressTimer = null;
+    }
+
+    // Multi-finger lifts fire one touchend PER finger, not one for the
+    // whole gesture. e.touches lists whatever fingers are still down
+    // after this particular lift. If any are still down, this isn't
+    // really the end of the gesture yet - bail out and wait for the
+    // touchend of the last finger, otherwise the earlier touchend's
+    // cleanup (e.g. resetting _hasMoved) makes the later touchend look
+    // like a fresh no-movement tap and incorrectly drops the drag.
+    if (e.touches && e.touches.length > 0) {
+      return;
     }
     
     // Two Finger End Logic
@@ -282,33 +423,51 @@ class LnxlinkTouchpad extends HTMLElement {
       // Reset scroll/two-finger state
       this._isTwoFingerTap = false;
       this._isTwoFingerDrag = false;
+
+      const scrollIndicator = this.querySelector("#scroll-indicator");
+      if (scrollIndicator) scrollIndicator.style.display = "none";
+
       this._cancel();
+
+      // Fingers just lifted off the scroll gesture - if drag mode is
+      // still active, this is the moment to (re)start the inactivity
+      // countdown, same as lifting after a single-finger drag move.
+      if (this._isMouseDown) {
+        this._resetDragInactivityTimer();
+      }
+
       return;
     }
     
-    if (this._isMouseDown && !this._hasMoved) {
-      console.log("Releasing drag");
-      this._releaseDrag();
-      this._cancel();
-      return;
-    }
-    
-    if (this._isLongPress) {
-      if (!this._isMouseDown) {
+    // Already in drag mode (regardless of whether THIS touch is the one
+    // that originally triggered the long-press - _isLongPress only gets
+    // set on the touch that starts the drag, not on subsequent re-touches).
+    if (this._isMouseDown) {
+      if (!this._hasMoved) {
+        // Tapped without moving while dragging = drop/release.
+        console.log("Releasing drag");
+        this._releaseDrag();
         this._cancel();
       } else {
+        // Finger lifted after moving something - stay in drag mode,
+        // waiting for the next touch (or the inactivity timeout).
         this._isDragging = false;
+        this._pointerDown = false;
         this._lastX = null;
         this._lastY = null;
         this._startX = null;
         this._startY = null;
         this._hasMoved = false;
         this._isLongPress = false;
-        
+
         const indicator = this.querySelector("#indicator");
         if (indicator) {
           indicator.style.background = "rgba(255,255,255,0.3)";
         }
+
+        // Pointer just lifted while still in drag mode - now (and only
+        // now) start the countdown to auto-release the drag.
+        this._resetDragInactivityTimer();
       }
       return;
     }
@@ -332,13 +491,18 @@ class LnxlinkTouchpad extends HTMLElement {
     }
     
     this._isDragging = false;
+    this._pointerDown = false;
     this._isTwoFingerDrag = false; // Ensure this is reset
+    this._isTwoFingerTap = false;
     this._lastX = null;
     this._lastY = null;
     this._startX = null;
     this._startY = null;
     this._hasMoved = false;
     this._isLongPress = false;
+
+    const scrollIndicator = this.querySelector("#scroll-indicator");
+    if (scrollIndicator) scrollIndicator.style.display = "none";
     
     const indicator = this.querySelector("#indicator");
     if (indicator) {
@@ -383,9 +547,16 @@ class LnxlinkTouchpad extends HTMLElement {
   }
 
   _startDrag() {
+    // Idempotency guard: if we're already in drag mode, ignore this call
+    // entirely. This protects against any duplicate trigger reaching here
+    // (e.g. overlapping touch/mouse events on some devices) - no matter
+    // the upstream cause, drag mode can only ever be entered once per
+    // press, so the vibration/visuals/service call can't double-fire.
+    if (this._isMouseDown) return;
+
     if (!this.config.drag_start_action || !this._hass) return;
     this._isMouseDown = true;
-    if (navigator.vibrate) navigator.vibrate([50, 30, 50]);
+    if (navigator.vibrate) navigator.vibrate(40);
     
     const dragIndicator = this.querySelector("#drag-indicator");
     if (dragIndicator) dragIndicator.style.display = "block";
@@ -394,7 +565,9 @@ class LnxlinkTouchpad extends HTMLElement {
     if (pad) pad.style.background = "#8b5a3c";
     
     this._executeAction(this.config.drag_start_action);
-    this._resetDragInactivityTimer();
+    // Do NOT start the inactivity countdown here - the finger that
+    // triggered the long-press is still down. The countdown should only
+    // run once the pointer is lifted (see _end()'s sticky-drag branch).
   }
 
   _resetDragInactivityTimer() {
@@ -410,6 +583,7 @@ class LnxlinkTouchpad extends HTMLElement {
   _releaseDrag() {
     if (!this.config.drag_end_action || !this._hass) return;
     this._isMouseDown = false;
+    this._pointerDown = false;
     if (navigator.vibrate) navigator.vibrate(20);
     if (this._dragInactivityTimer) {
       clearTimeout(this._dragInactivityTimer);
@@ -471,7 +645,9 @@ class LnxlinkTouchpad extends HTMLElement {
       coord_entity: "",
       sensitivity: 1.0,
       acceleration: 1.5,
-      scroll_sensitivity: 20,
+      scroll_sensitivity: 40,
+      scroll_min_interval: 120,
+      scroll_acceleration: 15,
       long_press_threshold: 500,
       movement_threshold: 5,
       drag_inactivity_timeout: 600,
@@ -491,7 +667,9 @@ class LnxlinkTouchpadEditor extends HTMLElement {
       coord_entity: "",
       sensitivity: 1.0,
       acceleration: 1.5,
-      scroll_sensitivity: 20,
+      scroll_sensitivity: 40,
+      scroll_min_interval: 120,
+      scroll_acceleration: 15,
       long_press_threshold: 500,
       movement_threshold: 5,
       drag_inactivity_timeout: 600,
@@ -503,6 +681,18 @@ class LnxlinkTouchpadEditor extends HTMLElement {
       drag_end_action: { action: "none" },
       ...config
     };
+
+    if (this._rendered) {
+      // The form (including whichever field the user is actively typing
+      // into) already exists. Home Assistant calls setConfig() again on
+      // every keystroke as the edited value round-trips back down through
+      // config-changed, so rebuilding the DOM here would recreate the
+      // focused ha-selector on every character typed - on mobile that
+      // drops focus and closes the on-screen keyboard. Each selector
+      // already reflects the user's own input, so there's nothing to do.
+      return;
+    }
+
     this.render();
   }
 
@@ -510,12 +700,19 @@ class LnxlinkTouchpadEditor extends HTMLElement {
     this._hass = hass;
     if (!this._rendered) {
       this.render();
+    } else if (this._selectors) {
+      // Keep already-built selectors in sync with hass updates (entity
+      // states, theme, etc.) without tearing down and rebuilding the DOM.
+      for (const el of Object.values(this._selectors)) {
+        el.hass = hass;
+      }
     }
   }
 
   render() {
     if (!this._hass || !this._config) return;
     this._rendered = true;
+    this._selectors = {};
 
     if (!this.shadowRoot && !this._container) {
       this._container = document.createElement('div');
@@ -552,6 +749,14 @@ class LnxlinkTouchpadEditor extends HTMLElement {
       <div class="config-row">
         <label>Scroll Sensitivity (px)</label>
         <div class="selector-container" data-selector="scroll_sensitivity"></div>
+      </div>
+      <div class="config-row">
+        <label>Scroll Min Interval (ms)</label>
+        <div class="selector-container" data-selector="scroll_min_interval"></div>
+      </div>
+      <div class="config-row">
+        <label>Scroll Acceleration</label>
+        <div class="selector-container" data-selector="scroll_acceleration"></div>
       </div>
       <div class="config-row">
         <label>Movement Threshold (px)</label>
@@ -599,6 +804,8 @@ class LnxlinkTouchpadEditor extends HTMLElement {
     this._createSelector('sensitivity', { number: { min: 0.1, max: 5.0, step: 0.1, mode: "box" } }, this._config.sensitivity, this._handleChange.bind(this, 'sensitivity'));
     this._createSelector('acceleration', { number: { min: 1.0, max: 5.0, step: 0.1, mode: "box" } }, this._config.acceleration, this._handleChange.bind(this, 'acceleration'));
     this._createSelector('scroll_sensitivity', { number: { min: 5, max: 100, step: 5, mode: "box" } }, this._config.scroll_sensitivity, this._handleChange.bind(this, 'scroll_sensitivity'));
+    this._createSelector('scroll_min_interval', { number: { min: 0, max: 500, step: 10, mode: "box" } }, this._config.scroll_min_interval, this._handleChange.bind(this, 'scroll_min_interval'));
+    this._createSelector('scroll_acceleration', { number: { min: 0, max: 5.0, step: 0.1, mode: "box" } }, this._config.scroll_acceleration, this._handleChange.bind(this, 'scroll_acceleration'));
     this._createSelector('movement_threshold', { number: { min: 1, max: 50, step: 1, mode: "box" } }, this._config.movement_threshold, this._handleChange.bind(this, 'movement_threshold'));
     this._createSelector('long_press_threshold', { number: { min: 100, max: 2000, step: 50, mode: "box" } }, this._config.long_press_threshold, this._handleChange.bind(this, 'long_press_threshold'));
     this._createSelector('drag_inactivity_timeout', { number: { min: 100, max: 5000, step: 100, mode: "box" } }, this._config.drag_inactivity_timeout, this._handleChange.bind(this, 'drag_inactivity_timeout'));
@@ -621,6 +828,7 @@ class LnxlinkTouchpadEditor extends HTMLElement {
     selectorEl.addEventListener('value-changed', changeHandler);
     containerEl.innerHTML = '';
     containerEl.appendChild(selectorEl);
+    this._selectors[name] = selectorEl;
   }
 
   _handleChange(key, ev) {
@@ -644,5 +852,5 @@ window.customCards.push({
   name: "LnxLink Touchpad",
   description: "Virtual touchpad for controlling mouse movements via LnxLink",
   preview: false,
-  documentationURL: "https://github.com/your-repo/lnxlink-touchpad"
+  documentationURL: "https://github.com/bkbilly/lnxlink-touchpad-card"
 });
